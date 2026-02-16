@@ -1,13 +1,49 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
+#include <MPU6050.h>
 
-const char *ap_ssid = "ESP32_AP";
-const char *ap_password = "password123";
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+MPU6050 mpu;
 
-WiFiServer ballServer(5000);
+const int PHOTO_PIN = 21;
+const int PHOTO_PIN2 = 13;
+const int PHOTO_PIN3 = 12;
+
+const int RESET_BUTTON_PIN = 14;
+
+const float INTERRUPT_VOLTAGE = 2.2;
+const float INTERRUPT_VOLTAGE2 = 1.5;
+const float INTERRUPT_VOLTAGE3 = 1.5;
+const long cooldown = 5000;
+
+float prevVoltage = 0.0;
+int cycleCount = 0;
+bool wasInterrupted = false;
+unsigned long interruptTime = 0;
+unsigned long lastButtonPress = 0;
+const unsigned long debounceDelay = 50;
+
+float globalV1 = 0.0;
+float globalV2 = 0.0;
+float globalV3 = 0.0;
+
+WiFiServer sensorServer(5000);
 WiFiServer pcServer(5001);
-
-WiFiClient ballClient;
+WiFiClient sensorClient;
 WiFiClient pcClient;
+
+const unsigned long CLIENT_TIMEOUT = 8000;
+unsigned long lastSensorActivity = 0;
+unsigned long lastPCActivity = 0;
+unsigned long lastHeartbeat = 0;
+
+const char *sta_ssid = "";
+const char *sta_password = "";
+
+unsigned long lastWiFiAttempt = 0;
+const unsigned long wifiAttemptInterval = 3000;
+bool wifiConnected = false;
 
 int R_IS = 19;
 int R_EN = 18;
@@ -16,37 +52,22 @@ int L_IS = 17;
 int L_EN = 16;
 int L_PWM = 4;
 
-float ball_ax = 0.0;
-float ball_ay = 0.0;
-float ball_az = 0.0;
-
-float filteredOffset = 0.0;
-float targetOffset = 0.0;
-
 int currentMotorSpeed = 0;
 
-unsigned long lastBallData = 0;
-unsigned long lastPcActivity = 0;
-unsigned long lastHeartbeat = 0;
-
-const unsigned long ballTimeout = 2000;
-const unsigned long pcTimeout = 8000;
-
 void setMotorSpeed(int speed) {
-  speed = constrain(speed, -255, 255);
+  speed = -speed;
   currentMotorSpeed = speed;
 
   if (speed > 0) {
     digitalWrite(L_IS, HIGH);
     digitalWrite(R_IS, LOW);
     analogWrite(L_PWM, speed);
-    analogWrite(R_PWM, 0);
   } else if (speed < 0) {
     digitalWrite(R_IS, HIGH);
     digitalWrite(L_IS, LOW);
     analogWrite(R_PWM, -speed);
-    analogWrite(L_PWM, 0);
-  } else {
+  }
+  else {
     analogWrite(L_PWM, 0);
     analogWrite(R_PWM, 0);
     digitalWrite(L_IS, LOW);
@@ -55,110 +76,100 @@ void setMotorSpeed(int speed) {
 }
 
 void sendToPC(String data) {
+  Serial.println(data);
+
   unsigned long now = millis();
 
-  if (!pcClient.connected() || (now - lastPcActivity > pcTimeout)) {
+  if (!pcClient.connected() || (now - lastPCActivity > CLIENT_TIMEOUT)) {
     if (pcClient.connected()) {
       pcClient.stop();
+      Serial.println("PC timeout -> reconnect");
     }
     pcClient = pcServer.available();
   }
 
-  if (pcClient && pcClient.connected()) {
+  if (pcClient.connected()) {
     pcClient.println(data);
-    lastPcActivity = now;
+    lastPCActivity = now;
+  }
+
+  if (!sensorClient.connected() || (now - lastSensorActivity > CLIENT_TIMEOUT)) {
+    if (sensorClient.connected()) {
+      sensorClient.stop();
+      Serial.println("Sensor timeout -> reconnect");
+    }
+    sensorClient = sensorServer.available();
+  }
+
+  if (sensorClient.connected()) {
+    sensorClient.println(data);
+    lastSensorActivity = now;
   }
 }
 
-void parseBallData(String data) {
-  int axIndex = data.indexOf("ax_g:");
-  int ayIndex = data.indexOf("ay_g:");
-  int azIndex = data.indexOf("az_g:");
-
-  if (axIndex == -1 || ayIndex == -1 || azIndex == -1) return;
-
-  int axEnd = data.indexOf("|", axIndex);
-  int ayEnd = data.indexOf("|", ayIndex);
-  int azEnd = data.indexOf("|", azIndex);
-
-  ball_ax = data.substring(axIndex + 5, axEnd).toFloat();
-  ball_ay = data.substring(ayIndex + 5, ayEnd).toFloat();
-  ball_az = data.substring(azIndex + 5, azEnd).toFloat();
-
-  float predictedShift = ball_ax * 120.0;
-  float spinCompensation = ball_ay * 60.0;
-
-  targetOffset = predictedShift + spinCompensation;
-  targetOffset = constrain(targetOffset, -300.0, 300.0);
-
-  lastBallData = millis();
-
-  String packet = "BALL|ax:" + String(ball_ax, 2) +
-                  "|ay:" + String(ball_ay, 2) +
-                  "|az:" + String(ball_az, 2) +
-                  "|target:" + String(targetOffset, 1);
-
-  sendToPC(packet);
-}
-
-void updateGoalControl() {
-  if (millis() - lastBallData > ballTimeout) {
-    targetOffset = 0;
-  }
-
-  filteredOffset = filteredOffset * 0.85 + targetOffset * 0.15;
-
-  float error = filteredOffset;
-  float kP = 0.9;
-
-  int speedCommand = (int)(error * kP);
-  speedCommand = constrain(speedCommand, -255, 255);
-
-  if (abs(speedCommand) < 15) {
-    speedCommand = 0;
-  }
-
-  if (speedCommand != currentMotorSpeed) {
-    setMotorSpeed(speedCommand);
-
-    String motorPacket = "MOTOR|speed:" + String(currentMotorSpeed) +
-                         "|offset:" + String(filteredOffset, 1);
-
-    sendToPC(motorPacket);
-  }
-}
-
-void handleClients() {
+void handleWiFiClients() {
   unsigned long now = millis();
 
-  if (!ballClient || !ballClient.connected()) {
-    ballClient = ballServer.available();
+  if (!sensorClient.connected() || (now - lastSensorActivity > CLIENT_TIMEOUT)) {
+    if (sensorClient.connected()) {
+      sensorClient.stop();
+    }
+    sensorClient = sensorServer.available();
+    if (sensorClient) {
+      Serial.println("Sensor connected");
+      lastSensorActivity = now;
+    }
   }
 
-  if (ballClient && ballClient.connected() && ballClient.available()) {
-    String data = ballClient.readStringUntil('\n');
+  if (!pcClient.connected() || (now - lastPCActivity > CLIENT_TIMEOUT)) {
+    if (pcClient.connected()) {
+      pcClient.stop();
+    }
+    pcClient = pcServer.available();
+    if (pcClient) {
+      Serial.println("PC connected");
+      lastPCActivity = now;
+    }
+  }
+
+  if (sensorClient.connected() && sensorClient.available()) {
+    String data = sensorClient.readStringUntil('\n');
     data.trim();
     if (data.length() > 0) {
-      parseBallData(data);
-    }
-  }
+      Serial.println("From sensor: " + data);
+      lastSensorActivity = now;
 
-  if (!pcClient || !pcClient.connected() || (now - lastPcActivity > pcTimeout)) {
-    if (pcClient.connected()) {
-      pcClient.stop();
+      if (pcClient.connected()) {
+        pcClient.println(data);
+        lastPCActivity = now;
+      }
     }
-    pcClient = pcServer.available();
-    lastPcActivity = now;
   }
 
   if (now - lastHeartbeat > 4000) {
-    sendToPC("HEARTBEAT");
+    if (pcClient.connected()) {
+      pcClient.println("HEARTBEAT");
+      lastPCActivity = now;
+    }
+    if (sensorClient.connected()) {
+      sensorClient.println("HEARTBEAT");
+      lastSensorActivity = now;
+    }
     lastHeartbeat = now;
   }
 }
 
 void setup() {
   Serial.begin(115200);
+
+  Wire.begin(22, 23);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Hits: 0");
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
 
   pinMode(R_IS, OUTPUT);
   pinMode(R_EN, OUTPUT);
@@ -171,15 +182,56 @@ void setup() {
   digitalWrite(L_EN, HIGH);
   setMotorSpeed(0);
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ap_ssid, ap_password);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
 
-  ballServer.begin();
+  interruptTime = millis() - cooldown;
+
+  WiFi.mode(WIFI_AP_STA);
+
+  WiFi.softAP("ESP32_AP", "password123");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  WiFi.begin(sta_ssid, sta_password);
+
+  sensorServer.begin();
   pcServer.begin();
+  Serial.println("TCP Servers started on 5000/5001");
+
+  mpu.initialize();
 }
 
 void loop() {
-  handleClients();
-  updateGoalControl();
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  float ax_cal_g = (ax - accel_offset_x) / 16384.0;
+  float ay_cal_g = (ay - accel_offset_y) / 16384.0;
+  float az_cal_g = (az - accel_offset_z) / 16384.0;
+
+  float ax_cal = ax_cal_g * 9.81;
+  float ay_cal = ay_cal_g * 9.81;
+  float az_cal = az_cal_g * 9.81;
+
+  float gx_cal = (gx - gyro_offset_x) / 131.0;
+  float gy_cal = (gy - gyro_offset_y) / 131.0;
+  float gz_cal = (gz - gyro_offset_z) / 131.0;
+
+  int desired_position = 0;
+
+  if (abs(ax_cal_g) > 0.3) {
+    desired_position = (ax_cal_g > 0) ? 1 : -1;
+  }
+
+  setMotorSpeed(desired_position * 255);
+
+  cycleCount++;
+  lcd.setCursor(6, 0);
+  lcd.print("      ");
+  lcd.setCursor(6, 0);
+  lcd.print(cycleCount);
+
+  sendToPC("WEB_INCREMENT:" + String(cycleCount));
+
+  handleWiFiClients();
   delay(10);
 }
